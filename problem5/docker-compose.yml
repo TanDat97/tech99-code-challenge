@@ -1,0 +1,48 @@
+version: '3.8'
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: problem5-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: houzez_dev
+      MYSQL_USER: tandat
+      MYSQL_PASSWORD: 12345678
+    ports:
+      - '3307:3306'
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    command: --default-authentication-plugin=mysql_native_password
+    healthcheck:
+      test: ['CMD', 'mysqladmin', 'ping', '-h', 'localhost']
+      timeout: 20s
+      retries: 10
+
+  app:
+    build: .
+    container_name: problem5-app
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      APP_PORT: 3000
+      APP_NAME: express-typescript
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_USERNAME: tandat
+      DB_PASSWORD: 12345678
+      DB_DATABASE: houzez_dev
+      DB_SYNCHRONIZE: false
+      DB_LOGGING: false
+    ports:
+      - '3000:3000'
+    depends_on:
+      mysql:
+        condition: service_healthy
+    volumes:
+      - ./logs:/app/logs
+
+volumes:
+  mysql_data:
