@@ -1,6 +1,6 @@
 {
   "watch": ["src"],
   "ext": "ts,json",
-  "ignore": ["src/**/*.spec.ts", "dist/**/*"],
-  "exec": "npm run build && node dist/app.js"
-} 
+  "ignore": ["src/**/*.spec.ts", "src/**/*.test.ts", "dist/**/*"],
+  "exec": "ts-node -r tsconfig-paths/register src/app.ts"
+}
