@@ -21,6 +21,16 @@
 
 - Auth: Bearer JWT on all endpoints. Optional HMAC request signature for increment. Rate limits apply.
 
+- POST `/v1/auth/register`
+  - Body: `{ "name": "string", "email": "string", "password": "string" }`
+  - Response 201: `{ "user_id": "u1", "token": "...", "expires_at": "iso8601" }`
+  - Errors: 400 (validation), 409 (already exists), 429 (rate limit)
+
+- POST `/v1/auth/login`
+  - Body: `{ "email": "string", "password": "string" }`
+  - Response 200: `{ "refresh_token": "..." "access_token": "...", "expires_at": "iso8601" }`
+  - Errors: 400 (validation), 401 (invalid credentials), 429 (rate limit)
+
 - POST `/v1/scores/increment`
   - Body: `{ "user_id": "string", "delta": number>0, "event_id": "uuid", "timestamp": "iso8601", "signature": "string" }`
   - Response 200: `{ "user_id": "u1", "new_score": 123, "rank": 7, "processed_event_id": "..." }`
@@ -159,6 +169,7 @@
 - Admin tooling: event reversal, user bans, and manual score adjustments with audit.
 - Developer ergonomics: OpenAPI spec and SDKs; chaos testing and load testing automation.
 
+
 ## Flow Diagram
 
 ```mermaid
@@ -167,6 +178,7 @@ sequenceDiagram
   participant G as API Gateway
   participant S as Score API
   participant B as Broker (Kafka/Redis Streams)
+  participant W as Score Worker
   participant D as PostgreSQL (Source of Truth)
   participant O as Outbox Dispatcher
   participant R as Redis Leaderboard (ZSET)
@@ -176,29 +188,96 @@ sequenceDiagram
   G->>S: Forward request
   S->>S: Validate auth, signature, schema, rate limit
 
-  rect rgb(245,245,245)
-    S->>D: BEGIN transaction
-    S->>D: INSERT user_score_histories(event_id, ...) ON CONFLICT DO NOTHING
-    alt New event
-      S->>D: UPDATE users SET score = score + delta RETURNING new_score
-      S->>D: INSERT outbox_score_updates(event_id, user_id, new_score)
-      D-->>S: COMMIT
-      S-->>C: 200 OK (or 202 Accepted if async)
-    else Duplicate event
-      D-->>S: ROLLBACK or no-op
-      S-->>C: 200 OK (idempotent) or 409 Conflict
-    end
-  end
+  S->>B: Enqueue score-increments {event_id, user_id, delta}
+  S-->>C: 202 Accepted
 
-  opt Async broker ingest
-    S->>B: Produce score-increments message {event_id, user_id, delta}
-    B->>S: Worker consumes in parallel
+  B-->>W: Deliver message {event_id, user_id, delta}
+
+  rect rgb(245,245,245)
+    W->>D: BEGIN transaction
+    W->>D: INSERT user_score_histories(event_id, ...) ON CONFLICT DO NOTHING
+    alt New event
+      W->>D: UPDATE users SET score = score + delta RETURNING new_score
+      W->>D: INSERT outbox_score_updates(event_id, user_id, new_score)
+      D-->>W: COMMIT
+      W->>RT: Publish leaderboard.updated / user.rank.updated
+    else Duplicate event
+      D-->>W: ROLLBACK or no-op
+    end
   end
 
   O->>D: Read unprocessed outbox rows (commit order)
   O->>R: ZADD/ZINCRBY leaderboard:global with new_score
   O->>D: Mark outbox row processed
-  S->>RT: Publish leaderboard.updated / user.rank.updated
   RT-->>C: Push realtime events
+```
+
+## Real time Flow Diagram
+
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant RT as Realtime Gateway
+  participant R as Redis Leaderboard (ZSET)
+  participant D as PostgreSQL (Source of Truth)
+
+  C->>RT: Connect (WebSocket/SSE)
+  RT-->>C: Connection established
+
+  C->>RT: Request top 10
+  RT->>R: ZREVRANGE leaderboard:global 0 9 WITHSCORES
+  alt Cache hit
+    R-->>RT: Top 10 snapshot
+    RT-->>C: leaderboard.updated (top 10)
+  else Cache miss
+    RT->>D: SELECT top 10 FROM users ORDER BY score DESC LIMIT 10
+    D-->>RT: Top 10 rows
+    RT->>R: ZADD/ZUNIONSTORE refresh leaderboard:global
+    RT-->>C: leaderboard.updated (top 10)
+  end
+```
+
+## Auth & Signature Flow Diagram
+
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant G as API Gateway
+  participant A as Auth API
+  participant K as Signing Secret Store (DB/KMS)
+  participant S as Score API
+
+  rect rgb(245,245,245)
+    Note over C,A: Registration
+    C->>G: POST /v1/auth/register {name, email, password}
+    G->>A: Forward request
+    A->>A: Validate input, hash password
+    A->>K: Generate & store signing_secret for user
+    A-->>C: 201 {user_id, access_token, refresh_token, expires_at}
+  end
+
+  rect rgb(245,245,245)
+    Note over C,A: Login
+    C->>G: POST /v1/auth/login {email, password}
+    G->>A: Forward request
+    A->>A: Verify credentials
+    A-->>C: 200 {access_token, refresh_token, expires_at}
+  end
+
+  rect rgb(245,245,245)
+    Note over C,S: Signed increment request
+    C->>C: Compose payload (user_id, delta, event_id, timestamp)
+    C->>C: signature = HMAC-SHA256(secret, user_id|delta|event_id|timestamp)
+    C->>G: POST /v1/scores/increment (Authorization: Bearer JWT, X-Signature, payload)
+    G->>S: Forward request
+    S->>S: Validate JWT, schema, rate limit, timestamp skew <= 60s
+    S->>K: Lookup signing_secret by user_id
+    S->>S: Recompute HMAC and compare
+    alt Valid signature
+      S-->>C: 202 Accepted (enqueued)
+    else Invalid signature
+      S-->>C: 400/401 Signature invalid
+    end
+  end
 ```
 
