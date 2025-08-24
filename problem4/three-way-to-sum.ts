@@ -10,7 +10,7 @@ function sum_to_n_a(n: number): number {
 function sum_to_n_b(n: number): number {
   // your code here
   if (n <= 1) return n;
-  return n + sum_to_n_a(n - 1);
+  return n + sum_to_n_b(n - 1);
 }
 
 function sum_to_n_c(n: number): number {
